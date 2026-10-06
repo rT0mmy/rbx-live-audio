@@ -1,0 +1,880 @@
+--!nonstrict
+--!native
+
+local Config = require(`./Config`)
+local Crossfade = require(`./Crossfade`)
+local Mixer = require(`./Mixer`)
+local Value = require(`./Value`)
+
+local Voice = {}
+Voice.__index = Voice
+
+--[[
+	Whether a new value is far enough from the last one written to be worth writing
+
+	@param last any
+	@param value any
+	@return boolean
+--]]
+local function changed(last: any, value: any): boolean
+	if type(last) == 'number' and type(value) == 'number' then
+		--// Zero is written exactly, so a faded-out property really is silent
+		if value == 0 then return last ~= 0 end
+
+		return math.abs(value - last) > Config.WriteTolerance * math.max(1, math.abs(last))
+	end
+
+	return last ~= value
+end
+
+--[[
+	A bound value as a play state
+
+	@param value any
+	@return boolean
+--]]
+local function truthy(value: any): boolean
+	if type(value) == 'number' then return value > 0.5 end
+
+	return value == true
+end
+
+--[[
+	Sets a plan's constant properties on its instance, naming the patch if one is wrong
+
+	@param instance Instance
+	@param plan Plan
+	@param patchName string
+	@return nil
+--]]
+local function applyStatic(instance: Instance, plan, patchName: string)
+	for key, value in plan.Static do
+		local ok, issue = pcall(function()
+			(instance :: any)[key] = value
+		end)
+
+		if not ok then error(`Audio.Patch '{patchName}' - {plan.Class}.{key}: {issue}`, 0) end
+	end
+end
+
+--[[
+	The slot instances an emitter sits on
+
+	@param slots {[string]: Instance | {Instance}}?
+	@param name string
+	@param patchName string
+	@return {Instance}
+--]]
+local function slotOf(slots, name: string, patchName: string): { Instance }
+	local slot = slots and slots[name]
+	assert(slot, `Audio.Patch '{patchName}' - spawned without slot '{name}'`)
+
+	local list = if typeof(slot) == 'Instance' then { slot } else slot
+	assert(type(list) == 'table' and #list > 0, `Audio.Patch '{patchName}' - slot '{name}' is empty`)
+
+	--// An emitter under anything else has no position and is silently never heard
+	for _, at in list do
+		assert(
+			typeof(at) == 'Instance' and (at:IsA('Attachment') or at:IsA('PVInstance') or at:IsA('Camera')),
+			`Audio.Patch '{patchName}' - slot '{name}' must be an Attachment, part, model or camera`
+		)
+	end
+
+	return list
+end
+
+--[[
+	Builds a voice. Use Patch:Spawn rather than calling this.
+
+	@param patch Compiled
+	@param slots {[string]: Instance | {Instance}}? -- what each emitter sits on
+	@param params {[string]: number}? -- starting values; anything left out takes its default
+	@return Voice
+--]]
+function Voice.new(patch, slots, params)
+	local bus = Mixer.Bus(patch.Bus)
+	local paramCount = #patch.Params
+	local bindingCount = #patch.Bindings
+
+	local self = setmetatable({
+		Patch = patch,
+		Bus = bus,
+
+		Alive = true,
+		Dying = false,
+		Real = false, -- the mixer has given it a place
+		Sounding = false, -- its players are running; stays true through a fade-out
+
+		Values = table.create(paramCount, 0),
+		Targets = table.create(paramCount, 0),
+		Dirty = table.create(paramCount, false),
+		AnyDirty = false,
+
+		Nodes = table.create(#patch.Plans), -- [plan] = Instance, {AudioEmitter}, or a crossfade's state
+		Last = table.create(bindingCount), -- [binding] = the value last written
+		Stamp = table.create(bindingCount, 0),
+		Frame = 0,
+
+		Players = {}, -- [plan] = whether that AudioPlayer should be playing
+		Named = {}, -- [name] = plan, for Play, Stop and Instance
+		Crossfades = {}, -- plans
+		Emitters = {},
+		Waiting = false, -- a crossfade layer has gone quiet and is due to stop
+
+		PatchVolume = patch.Volume,
+		Envelope = 0,
+		EnvelopeTarget = 0,
+		FadeRate = 0,
+		GateDirty = true,
+
+		Remaining = 0, -- OneShot: players still to finish
+		Deadline = math.huge,
+
+		Connections = {},
+		Folder = nil,
+	}, Voice)
+
+	for i, param in patch.Params do
+		local start = params and params[param.Name]
+		local value = if type(start) == 'number' then math.clamp(start, param.Min, param.Max) else param.Default
+
+		self.Values[i] = value
+		self.Targets[i] = value
+	end
+
+	local folder = Instance.new('Folder')
+	folder.Name = patch.Name
+	self.Folder = folder
+
+	self:_Build(slots, folder)
+	self:_Wire(folder)
+
+	--// Every binding once, so the graph starts where its parameters are
+	for index in patch.Bindings do
+		self:_Apply(index, os.clock())
+	end
+
+	folder.Parent = Mixer.VoiceFolder()
+
+	if Mixer.Add(self) then
+		self.Real = true
+		self.Envelope = 1
+		self.EnvelopeTarget = 1
+		self:_Start(os.clock())
+
+		if self.Alive then self:_WriteGates() end
+	elseif patch.OneShot then
+		self:_Teardown()
+	end
+
+	return self
+end
+
+--[[
+	Creates an instance for every plan
+
+	@param slots {[string]: Instance | {Instance}}?
+	@param folder Folder
+	@return nil
+--]]
+function Voice._Build(self, slots, folder: Folder)
+	local patch = self.Patch
+
+	for index, plan in patch.Plans do
+		if plan.Kind == 'Emitter' then
+			local emitters = {}
+
+			for _, at in slotOf(slots, plan.At, patch.Name) do
+				local emitter = Instance.new('AudioEmitter')
+				emitter.Name = plan.Name or plan.At
+				emitter.AudioInteractionGroup = self.Bus.Group
+
+				if plan.Distance then emitter:SetDistanceAttenuation(plan.Distance) end
+				if plan.Angle then emitter:SetAngleAttenuation(plan.Angle) end
+
+				applyStatic(emitter, plan, patch.Name)
+
+				emitter.Parent = at
+
+				table.insert(emitters, emitter)
+				table.insert(self.Emitters, emitter)
+
+				table.insert(
+					self.Connections,
+					at.Destroying:Connect(function()
+						self:Destroy(0)
+					end)
+				)
+			end
+
+			self.Nodes[index] = emitters
+		elseif plan.Kind == 'Send' then
+			--// No instance of its own: its parent wires straight to the node it names
+			self.Nodes[index] = false
+		elseif plan.Kind == 'Crossfade' then
+			local state = { Players = {}, Playing = {}, Loud = {}, Gain = {}, Speed = {}, QuietSince = {} }
+
+			for j, layer in plan.Layers do
+				local player = Instance.new('AudioPlayer')
+				player.Name = `{plan.Name or 'Crossfade'}_{layer.At}`
+				player.Asset = layer.Asset
+				player.Looping = true
+				player.Volume = 0
+				player.Parent = folder
+
+				state.Players[j] = player
+				state.Playing[j] = false
+				state.Loud[j] = false
+				state.Gain[j] = 0
+			end
+
+			self.Nodes[index] = state
+			table.insert(self.Crossfades, index)
+
+			if plan.Name then self.Named[plan.Name] = index end
+		else
+			local instance = Instance.new(plan.Class)
+			if plan.Name then instance.Name = plan.Name end
+
+			applyStatic(instance, plan, patch.Name)
+
+			if plan.Kind == 'Gate' then instance.Volume = 0 end
+
+			instance.Parent = folder
+			self.Nodes[index] = instance
+
+			if plan.Name then self.Named[plan.Name] = index end
+
+			if plan.Class == 'AudioPlayer' then self:_AdoptPlayer(index, plan, instance) end
+		end
+	end
+end
+
+--[[
+	Works out whether a plain player starts with the voice, and follows it to its end
+
+	@param index number
+	@param plan Plan
+	@param player AudioPlayer
+	@return nil
+--]]
+function Voice._AdoptPlayer(self, index: number, plan, player: AudioPlayer)
+	local oneShot = self.Patch.OneShot
+	local want = if plan.Play ~= nil then plan.Play else (player.Looping or oneShot)
+
+	self.Players[index] = want
+
+	if player.Looping then return end
+
+	if oneShot and want then
+		self.Remaining += 1
+	end
+
+	table.insert(
+		self.Connections,
+		player.Ended:Connect(function()
+			if not self.Alive then return end
+
+			if oneShot then
+				self.Remaining -= 1
+				if self.Remaining <= 0 then self:Destroy(0) end
+			else
+				--// Finished, so a later return from virtual does not replay it
+				self.Players[index] = false
+			end
+		end)
+	)
+end
+
+--[[
+	The outputs a plan offers its parent: its instance, or a crossfade's layers
+
+	@param index number
+	@return {Instance}
+--]]
+function Voice._Outputs(self, index: number): { Instance }
+	local plan = self.Patch.Plans[index]
+	local node = self.Nodes[index]
+
+	if plan.Kind == 'Crossfade' then return node.Players end
+	if plan.Kind == 'Emitter' then return {} end
+	if plan.Kind == 'Send' then return self:_Outputs(plan.Source) end
+
+	return { node }
+end
+
+--[[
+	@param folder Folder
+	@return nil
+--]]
+function Voice._Wire(self, folder: Folder)
+	local patch = self.Patch
+
+	for index, plan in patch.Plans do
+		if plan.Kind == 'Send' then continue end
+
+		local targets = if plan.Kind == 'Emitter' then self.Nodes[index] else { self.Nodes[index] }
+
+		for _, input in plan.Inputs do
+			for _, source in self:_Outputs(input) do
+				for _, target in targets do
+					Mixer.Wire(source, target, folder)
+				end
+			end
+		end
+	end
+
+	for _, gate in patch.BusGates do
+		Mixer.Wire(self.Nodes[gate], self.Bus.Input, folder)
+	end
+end
+
+--[[
+	Evaluates one binding and writes what it changes
+
+	@param index number
+	@param now number
+	@return nil
+--]]
+function Voice._Apply(self, index: number, now: number)
+	local binding = self.Patch.Bindings[index]
+	local target = binding.Target
+
+	if target == '@Crossfade' then
+		self:_Crossfade(binding, now)
+		return
+	end
+
+	local value = Value.Eval(binding.Spec, binding.Indices, self.Values)
+
+	if target == '@Volume' then
+		if value ~= self.PatchVolume then
+			self.PatchVolume = value
+			self.GateDirty = true
+		end
+
+		return
+	end
+
+	if target == '@Play' then
+		self:_Want(binding.Plan, truthy(value))
+		return
+	end
+
+	if not changed(self.Last[index], value) then return end
+	self.Last[index] = value
+
+	local node = self.Nodes[binding.Plan]
+
+	if typeof(node) == 'Instance' then
+		node[target] = value
+	else
+		for _, emitter in node do
+			emitter[target] = value
+		end
+	end
+end
+
+--[[
+	Re-weights a crossfade's layers for where its parameter is now
+
+	@param binding Binding
+	@param now number
+	@return nil
+--]]
+function Voice._Crossfade(self, binding, now: number)
+	local plan = self.Patch.Plans[binding.Plan]
+	local state = self.Nodes[binding.Plan]
+	local values = self.Values
+
+	local x = values[plan.By]
+	local speed = if binding.Speed
+		then Value.Eval(binding.Speed, binding.SpeedIndices, values)
+		else plan.Static.Speed or 1
+	local volume = if binding.Volume
+		then Value.Eval(binding.Volume, binding.VolumeIndices, values)
+		else plan.Static.Volume or 1
+
+	--// A voice that was retuned carries its own layer positions
+	local ats = state.Ats or plan.Ats
+	local lower, lowerWeight, upperWeight = Crossfade.Weights(ats, x)
+
+	for j, layer in plan.Layers do
+		local weight = if j == lower then lowerWeight elseif j == lower + 1 then upperWeight else 0
+		local player = state.Players[j]
+		local trim = if state.Trims then state.Trims[j] else layer.Volume
+		local gain = weight * trim * volume
+
+		if changed(state.Gain[j], gain) then
+			player.Volume = gain
+			state.Gain[j] = gain
+		end
+
+		--// By what reaches the output, so a crossfade turned right down stops its players too
+		local loud = gain > Config.LayerSilence
+		state.Loud[j] = loud
+
+		if loud then
+			local pitch = speed
+			if plan.Track then
+				pitch *= Crossfade.Pitch(x, ats[j], Config.MinPitch, Config.MaxPitch)
+			end
+
+			if changed(state.Speed[j], pitch) then
+				player.PlaybackSpeed = pitch
+				state.Speed[j] = pitch
+			end
+
+			state.QuietSince[j] = nil
+
+			if self.Sounding and not state.Playing[j] then
+				player:Play()
+				state.Playing[j] = true
+			end
+		elseif state.Playing[j] and not state.QuietSince[j] then
+			state.QuietSince[j] = now
+			self.Waiting = true
+		end
+	end
+end
+
+--[[
+	Stops crossfade layers that have been quiet for long enough
+
+	@param now number
+	@return nil
+--]]
+function Voice._StopQuietLayers(self, now: number)
+	local waiting = false
+
+	for _, index in self.Crossfades do
+		local state = self.Nodes[index]
+
+		for j, since in state.QuietSince do
+			if now - since >= Config.LayerHold then
+				state.Players[j]:Stop()
+				state.Playing[j] = false
+				state.QuietSince[j] = nil
+			else
+				waiting = true
+			end
+		end
+	end
+
+	self.Waiting = waiting
+end
+
+--[[
+	Starts or stops a plain player
+
+	@param index number
+	@param want boolean
+	@return nil
+--]]
+function Voice._Want(self, index: number, want: boolean)
+	if self.Players[index] == want then return end
+	self.Players[index] = want
+
+	if not self.Sounding then return end
+
+	local player = self.Nodes[index]
+
+	if want then
+		if not player.Looping then player.TimePosition = 0 end
+		player:Play()
+	else
+		player:Stop()
+	end
+end
+
+--[[
+	Starts every player that should be running
+
+	@param now number
+	@return nil
+--]]
+function Voice._Start(self, now: number)
+	if self.Sounding then return end
+	self.Sounding = true
+
+	for index, want in self.Players do
+		if want then self.Nodes[index]:Play() end
+	end
+
+	for _, index in self.Crossfades do
+		local state = self.Nodes[index]
+
+		for j, player in state.Players do
+			if state.Loud[j] then
+				player:Play()
+				state.Playing[j] = true
+			end
+		end
+	end
+
+	if self.Patch.OneShot then
+		if self.Remaining <= 0 then
+			self:Destroy(0)
+			return
+		end
+
+		self.Deadline = now + Config.OneShotTimeout
+	end
+end
+
+--[[
+	Stops every player, keeping where each loop was
+
+	@return nil
+--]]
+function Voice._Silence(self)
+	if not self.Sounding then return end
+	self.Sounding = false
+
+	for index in self.Players do
+		self.Nodes[index]:Stop()
+	end
+
+	for _, index in self.Crossfades do
+		local state = self.Nodes[index]
+
+		for j, player in state.Players do
+			if state.Playing[j] then player:Stop() end
+			state.Playing[j] = false
+		end
+
+		table.clear(state.QuietSince)
+	end
+
+	self.Waiting = false
+end
+
+--[[
+	@return nil
+--]]
+function Voice._WriteGates(self)
+	self.GateDirty = false
+
+	local volume = math.clamp(self.PatchVolume * self.Envelope, 0, 3)
+
+	for _, gate in self.Patch.Gates do
+		self.Nodes[gate].Volume = volume
+	end
+end
+
+--[[
+	The mixer granting or taking away a place
+
+	@param real boolean
+	@return nil
+--]]
+function Voice._SetReal(self, real: boolean)
+	if real == self.Real or self.Dying then return end
+	self.Real = real
+
+	if real then
+		self:_Start(os.clock())
+		self.EnvelopeTarget = 1
+		self.FadeRate = 1 / Config.FadeIn
+	elseif self.Patch.OneShot then
+		self:Destroy(Config.FadeOut)
+	else
+		self.EnvelopeTarget = 0
+		self.FadeRate = 1 / Config.FadeOut
+	end
+end
+
+--[[
+	How audible the voice is to a listener: its loudest emitter, 1 with none
+
+	@param listener AudioListener?
+	@return number
+--]]
+function Voice._Audibility(self, listener: AudioListener?): number
+	if #self.Emitters == 0 or not listener then return 1 end
+
+	local best = 0
+
+	for _, emitter in self.Emitters do
+		local audibility = emitter:GetAudibilityFor(listener)
+		if audibility > best then best = audibility end
+	end
+
+	return best
+end
+
+--[[
+	One frame
+
+	@param deltaTime number
+	@param now number
+	@return nil
+--]]
+function Voice._Step(self, deltaTime: number, now: number)
+	local patch = self.Patch
+	local params = patch.Params
+	local values, targets, dirty = self.Values, self.Targets, self.Dirty
+	local anyDirty = self.AnyDirty
+
+	for i, param in params do
+		local current, target = values[i], targets[i]
+
+		if current ~= target then
+			values[i] = Value.Approach(current, target, param.Smooth, deltaTime)
+			dirty[i] = true
+			anyDirty = true
+		end
+	end
+
+	if anyDirty then
+		local frame = self.Frame + 1
+		local stamp = self.Stamp
+		local byParam = patch.ByParam
+
+		self.Frame = frame
+		self.AnyDirty = false
+
+		for i = 1, #params do
+			if not dirty[i] then continue end
+			dirty[i] = false
+
+			for _, binding in byParam[i] do
+				if stamp[binding] == frame then continue end
+				stamp[binding] = frame
+
+				self:_Apply(binding, now)
+			end
+		end
+	end
+
+	local envelope, goal = self.Envelope, self.EnvelopeTarget
+
+	if envelope ~= goal then
+		local delta = self.FadeRate * deltaTime
+
+		envelope = if envelope < goal then math.min(goal, envelope + delta) else math.max(goal, envelope - delta)
+
+		self.Envelope = envelope
+		self.GateDirty = true
+
+		if envelope == 0 then
+			if self.Dying then
+				self:_Teardown()
+				return
+			end
+
+			self:_Silence()
+		end
+	end
+
+	if self.GateDirty then self:_WriteGates() end
+	if self.Waiting then self:_StopQuietLayers(now) end
+
+	if now >= self.Deadline then self:Destroy(0) end
+end
+
+--[[
+	Destroys everything the voice made and drops it from the mix
+
+	@return nil
+--]]
+function Voice._Teardown(self)
+	if not self.Alive then return end
+
+	self.Alive = false
+	self.Sounding = false
+
+	for _, connection in self.Connections do
+		connection:Disconnect()
+	end
+
+	table.clear(self.Connections)
+
+	for _, emitter in self.Emitters do
+		emitter:Destroy()
+	end
+
+	self.Folder:Destroy()
+	Mixer.Remove(self)
+end
+
+--// ---------------------------------------------------------------- Public
+
+--[[
+	Moves a parameter. It glides there at the patch's Smooth rate unless told to snap.
+
+	@param name string
+	@param value number
+	@param snap boolean? -- jump straight there, for a step like a gear change
+	@return nil
+--]]
+function Voice.Set(self, name: string, value: number, snap: boolean?)
+	if not self.Alive then return end
+
+	local index = self.Patch.ParamIndex[name]
+	assert(index, `Audio.Patch '{self.Patch.Name}' - has no param '{name}'`)
+
+	local param = self.Patch.Params[index]
+	value = math.clamp(value, param.Min, param.Max)
+
+	self.Targets[index] = value
+
+	if (snap or param.Smooth <= 0) and self.Values[index] ~= value then
+		self.Values[index] = value
+		self.Dirty[index] = true
+		self.AnyDirty = true
+	end
+end
+
+--[[
+	A parameter's current, smoothed value
+
+	@param name string
+	@return number
+--]]
+function Voice.Get(self, name: string): number
+	local index = self.Patch.ParamIndex[name]
+	assert(index, `Audio.Patch '{self.Patch.Name}' - has no param '{name}'`)
+
+	return self.Values[index]
+end
+
+--[[
+	Starts a named player: a loop that comes and goes, or a sound fired from inside a longer one.
+	A player that is not looping restarts from the top.
+
+	@param name string
+	@return nil
+--]]
+function Voice.Play(self, name: string)
+	if not self.Alive then return end
+
+	local index = self.Named[name]
+	assert(index and self.Players[index] ~= nil, `Audio.Patch '{self.Patch.Name}' - has no player named '{name}'`)
+
+	--// Re-asking for a finished one-off has to start it again
+	if self.Players[index] and not self.Nodes[index].Looping then self.Players[index] = false end
+
+	self:_Want(index, true)
+end
+
+--[[
+	@param name string
+	@return nil
+--]]
+function Voice.Stop(self, name: string)
+	if not self.Alive then return end
+
+	local index = self.Named[name]
+	assert(index and self.Players[index] ~= nil, `Audio.Patch '{self.Patch.Name}' - has no player named '{name}'`)
+
+	self:_Want(index, false)
+end
+
+--[[
+	Moves a named crossfade's layers along its parameter, and optionally sets each layer's volume,
+	on this voice only, without restarting anything. For tuning a patch by ear while it plays - a
+	volume of 0 takes a layer out entirely.
+
+	@param name string
+	@param ats {number} -- a position per layer, in the order the layers were given, ascending
+	@param trims {number}? -- a volume per layer, in place of each layer's own Volume
+	@return nil
+--]]
+function Voice.Retune(self, name: string, ats: { number }, trims: { number }?)
+	if not self.Alive then return end
+
+	local index = self.Named[name]
+	local plan = index and self.Patch.Plans[index]
+	assert(plan and plan.Kind == 'Crossfade', `Audio.Patch '{self.Patch.Name}' - has no crossfade named '{name}'`)
+	assert(#ats == #plan.Layers, `Audio.Patch '{self.Patch.Name}' - '{name}' has {#plan.Layers} layers`)
+
+	for i = 2, #ats do
+		assert(ats[i] > ats[i - 1], `Audio.Patch '{self.Patch.Name}' - '{name}' positions must ascend`)
+	end
+
+	if trims then assert(#trims == #ats, `Audio.Patch '{self.Patch.Name}' - '{name}' needs a volume per layer`) end
+
+	local state = self.Nodes[index]
+	state.Ats = table.clone(ats)
+	state.Trims = if trims then table.clone(trims) else nil
+
+	for bindingIndex, binding in self.Patch.Bindings do
+		if binding.Plan == index then self:_Apply(bindingIndex, os.clock()) end
+	end
+end
+
+--[[
+	Re-evaluates every binding now. For when something a Compute reads outside the voice's params
+	has changed - a sound switched off, a value retuned - and the params themselves have not moved.
+
+	@return nil
+--]]
+function Voice.Refresh(self)
+	if not self.Alive then return end
+
+	local now = os.clock()
+
+	for index in self.Patch.Bindings do
+		self:_Apply(index, now)
+	end
+end
+
+--[[
+	A named node's instance, for wiring something of your own off it - an analyzer, a meter
+
+	@param name string
+	@return Instance
+--]]
+function Voice.Instance(self, name: string): Instance
+	local index = self.Named[name]
+	assert(index, `Audio.Patch '{self.Patch.Name}' - has no node named '{name}'`)
+
+	return self.Nodes[index]
+end
+
+--[[
+	Fades the voice out and destroys it
+
+	@param fade number? -- seconds; Config.Release by default, 0 cuts it dead
+	@return nil
+--]]
+function Voice.Destroy(self, fade: number?)
+	if not self.Alive or self.Dying then return end
+	self.Dying = true
+
+	local seconds = fade or Config.Release
+
+	if seconds <= 0 or not self.Sounding or self.Envelope <= 0 then
+		self:_Teardown()
+		return
+	end
+
+	self.EnvelopeTarget = 0
+	self.FadeRate = 1 / seconds
+end
+
+--[[
+	What the voice is doing, for debugging
+
+	@return {[string]: any}
+--]]
+function Voice.Inspect(self)
+	local params = {}
+
+	for i, param in self.Patch.Params do
+		params[param.Name] = self.Values[i]
+	end
+
+	return {
+		Name = self.Patch.Name,
+		Bus = self.Bus.Name,
+		Real = self.Real,
+		Sounding = self.Sounding,
+		Dying = self.Dying,
+		Volume = self.PatchVolume * self.Envelope,
+		Params = params,
+	}
+end
+
+return Voice
