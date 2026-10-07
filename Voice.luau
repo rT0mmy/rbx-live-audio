@@ -532,7 +532,10 @@ function Voice._Silence(self)
 	self.Sounding = false
 
 	for index in self.Players do
-		self.Nodes[index]:Stop()
+		local player = self.Nodes[index]
+		player:Stop()
+
+		if not player.Looping then self.Players[index] = false end
 	end
 
 	for _, index in self.Crossfades do
@@ -752,8 +755,12 @@ function Voice.Play(self, name: string)
 	local index = self.Named[name]
 	assert(index and self.Players[index] ~= nil, `Audio.Patch '{self.Patch.Name}' - has no player named '{name}'`)
 
+	local looping = self.Nodes[index].Looping
+	
+	if not looping and not self.Sounding then return end
+
 	--// Re-asking for a finished one-off has to start it again
-	if self.Players[index] and not self.Nodes[index].Looping then self.Players[index] = false end
+	if self.Players[index] and not looping then self.Players[index] = false end
 
 	self:_Want(index, true)
 end

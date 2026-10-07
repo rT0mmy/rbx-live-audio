@@ -15,6 +15,9 @@ Config.Buses = {
 	{ Name = 'EngineLoop', Parent = 'Engine', Spatial = true, Voices = 8, Duck = 'Hero' },
 	{ Name = 'EngineTransient', Parent = 'Engine', Spatial = true, Voices = 16, Duck = 'Hero' },
 
+	--// Pops and anti-lag bangs. Uncapped: each car holds an idle voice per exhaust, ready to fire
+	{ Name = 'Afterfire', Parent = 'Engine', Spatial = true, Duck = 'Hero' },
+
 	--// The clients car (Hero)
 	{
 		Name = 'Hero',
@@ -34,7 +37,8 @@ Config.Buses = {
 
 	{ Name = 'Tyres', Parent = 'Vehicles', Spatial = true, Voices = 8 },
 	{ Name = 'Brakes', Parent = 'Vehicles', Spatial = true, Voices = 6 },
-	{ Name = 'Impacts', Parent = 'Vehicles', Spatial = true, Voices = 8 },
+	
+	{ Name = 'Impacts', Parent = 'Vehicles', Spatial = true },
 	{ Name = 'Road', Parent = 'Vehicles', Spatial = true, Voices = 4 },
 	{ Name = 'Wind', Parent = 'Vehicles', Spatial = true, Voices = 2 },
 	{ Name = 'Horn', Parent = 'Vehicles', Spatial = true, Voices = 6 },

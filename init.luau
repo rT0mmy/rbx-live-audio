@@ -1,4 +1,5 @@
 --!nonstrict
+--!native
 
 --// Declarative audio on the Audio API
 --//
