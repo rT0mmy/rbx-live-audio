@@ -70,7 +70,10 @@ export type Compiled = {
 	Volume: number, -- the patch's constant volume when it is not bound
 
 	Spatial: boolean,
+	Reach: number, -- studs past which every emitter's distance curve has fallen to 0; math.huge if one never does
 	Assets: { string },
+
+	Spare: { any }, -- OneShot: finished voices kept built for the next Play, oldest first
 }
 
 local busByName: { [string]: any } = {}
@@ -94,6 +97,32 @@ local function dictionary(points: Value.Points?): { [number]: number }?
 	end
 
 	return out
+end
+
+--[[
+	The distance from which a distance curve stays at 0 for good
+
+	@param points Points?
+	@return number -- math.huge when it never gets there, or there is no curve
+--]]
+local function reachOf(points: Value.Points?): number
+	if not points or #points == 0 then return math.huge end
+
+	local sorted = table.clone(points)
+	table.sort(sorted, function(a, b)
+		return a[1] < b[1]
+	end)
+
+	if sorted[#sorted][2] > 0 then return math.huge end
+
+	local reach = sorted[#sorted][1]
+
+	for i = #sorted - 1, 1, -1 do
+		if sorted[i][2] > 0 then break end
+		reach = sorted[i][1]
+	end
+
+	return reach
 end
 
 --[[
@@ -267,6 +296,7 @@ function Patch.Compile(def: { [any]: any }): Compiled
 	local gates = {}
 	local busGates = {}
 	local spatial = false
+	local reach = 0
 
 	local function gate(): (number, Plan)
 		local index = #plans + 1
@@ -284,6 +314,7 @@ function Patch.Compile(def: { [any]: any }): Compiled
 		if desc.Kind == 'Emitter' then
 			assert(bus.Spatial, `{where} - has an Emitter but bus '{bus.Name}' is not Spatial`)
 			spatial = true
+			reach = math.max(reach, reachOf(desc.Distance))
 
 			local emitterIndex = #plans + 1
 			local emitter: Plan = {
@@ -385,7 +416,10 @@ function Patch.Compile(def: { [any]: any }): Compiled
 		Volume = volume,
 
 		Spatial = spatial,
+		Reach = if spatial then reach else math.huge,
 		Assets = assets,
+
+		Spare = {},
 	}
 end
 

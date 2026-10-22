@@ -310,6 +310,16 @@ function Mixer.Add(voice): boolean
 	voices[voice] = true
 	bus.Voices[voice] = true
 
+	return Mixer.HasRoom(bus)
+end
+
+--[[
+	Whether one more voice may sound on a bus right now
+
+	@param bus Bus
+	@return boolean
+--]]
+function Mixer.HasRoom(bus: Bus): boolean
 	if not bus.Cap then return true end
 
 	local sounding = 0

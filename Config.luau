@@ -37,7 +37,7 @@ Config.Buses = {
 
 	{ Name = 'Tyres', Parent = 'Vehicles', Spatial = true, Voices = 8 },
 	{ Name = 'Brakes', Parent = 'Vehicles', Spatial = true, Voices = 6 },
-	
+
 	{ Name = 'Impacts', Parent = 'Vehicles', Spatial = true },
 	{ Name = 'Road', Parent = 'Vehicles', Spatial = true, Voices = 4 },
 	{ Name = 'Wind', Parent = 'Vehicles', Spatial = true, Voices = 2 },
@@ -97,6 +97,9 @@ Config.WriteTolerance = 1e-3
 
 --// Seconds a one-shot may run before it is reclaimed, in case its end is never reported
 Config.OneShotTimeout = 30
+
+--// Finished one-shot voices each patch keeps built, so playing it again needs no new instances
+Config.SpareVoices = 4
 
 Config.FolderName = '_Audio'
 Config.GroupPrefix = 'Audio/'

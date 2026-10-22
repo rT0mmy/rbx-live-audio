@@ -84,6 +84,125 @@ local function slotOf(slots, name: string, patchName: string): { Instance }
 end
 
 --[[
+	Where a slot instance is, for judging whether a one-shot on it could be heard
+
+	@param at Instance
+	@return Vector3? -- nil for a camera, which is always in earshot
+--]]
+local function positionOf(at: Instance): Vector3?
+	if at:IsA('Attachment') then return at.WorldPosition end
+	if at:IsA('BasePart') then return at.Position end
+	if at:IsA('Model') then return at:GetPivot().Position end
+
+	return nil
+end
+
+--[[
+	Whether every emitter of a patch would sit past its distance curve's reach from the listener
+
+	@param patch Compiled
+	@param slots {[string]: Instance | {Instance}}?
+	@return boolean -- false when unsure, so a malformed slot still reaches Voice.new and its asserts
+--]]
+local function outOfReach(patch, slots): boolean
+	if patch.Reach == math.huge or not slots then return false end
+
+	local camera = workspace.CurrentCamera
+	if not camera then return false end
+
+	local listener = camera.CFrame.Position
+	local reach = patch.Reach
+
+	local function far(at: any): boolean
+		if typeof(at) ~= 'Instance' then return false end
+
+		local position = positionOf(at)
+
+		return position ~= nil and (position - listener).Magnitude > reach
+	end
+
+	for _, plan in patch.Plans do
+		if plan.Kind ~= 'Emitter' then continue end
+
+		local slot = slots[plan.At]
+
+		if typeof(slot) == 'Instance' then
+			if not far(slot) then return false end
+		elseif type(slot) == 'table' and #slot > 0 then
+			for _, at in slot do
+				if not far(at) then return false end
+			end
+		else
+			return false
+		end
+	end
+
+	return true
+end
+
+--[[
+	A voice that never sounds, handed back for a one-shot that had no chance of being heard. Every
+	method on it does nothing.
+
+	@param patch Compiled
+	@param bus Bus
+	@return Voice
+--]]
+function Voice.Dead(patch, bus)
+	local values = table.create(#patch.Params, 0)
+
+	for i, param in patch.Params do
+		values[i] = param.Default
+	end
+
+	return setmetatable({
+		Patch = patch,
+		Bus = bus,
+		Alive = false,
+		Dying = false,
+		Real = false,
+		Sounding = false,
+		Values = values,
+		Nodes = {},
+		Named = {},
+		Players = {},
+		PatchVolume = 0,
+		Envelope = 0,
+	}, Voice)
+end
+
+--[[
+	Fires a OneShot patch: a finished voice of it on the same slots if one is spare, a new one if not,
+	or a dead one when its bus is full or the listener is out of its reach. Use Patch:Play rather than
+	calling this.
+
+	@param patch Compiled
+	@param slots {[string]: Instance | {Instance}}?
+	@param params {[string]: number}?
+	@return Voice
+--]]
+function Voice.Fire(patch, slots, params)
+	local bus = Mixer.Bus(patch.Bus)
+
+	if not Mixer.HasRoom(bus) or outOfReach(patch, slots) then return Voice.Dead(patch, bus) end
+
+	local spare = patch.Spare
+
+	for i = #spare, 1, -1 do
+		local voice = spare[i]
+
+		if voice:_SitsOn(slots) then
+			table.remove(spare, i)
+			voice:_Revive(params)
+
+			return voice
+		end
+	end
+
+	return Voice.new(patch, slots, params)
+end
+
+--[[
 	Builds a voice. Use Patch:Spawn rather than calling this.
 
 	@param patch Compiled
@@ -102,6 +221,8 @@ function Voice.new(patch, slots, params)
 
 		Alive = true,
 		Dying = false,
+		Parked = false, -- a finished one-shot kept in its patch's Spare
+		SlotGone = false, -- something it sits on was destroyed, so it can never be reused
 		Real = false, -- the mixer has given it a place
 		Sounding = false, -- its players are running; stays true through a fade-out
 
@@ -116,9 +237,11 @@ function Voice.new(patch, slots, params)
 		Frame = 0,
 
 		Players = {}, -- [plan] = whether that AudioPlayer should be playing
+		StartWants = {}, -- [plan] = Players as built, for reviving a spare one-shot
 		Named = {}, -- [name] = plan, for Play, Stop and Instance
 		Crossfades = {}, -- plans
 		Emitters = {},
+		Slots = {}, -- [emitter plan] = the instances its emitters sit on
 		Waiting = false, -- a crossfade layer has gone quiet and is due to stop
 
 		PatchVolume = patch.Volume,
@@ -128,19 +251,12 @@ function Voice.new(patch, slots, params)
 		GateDirty = true,
 
 		Remaining = 0, -- OneShot: players still to finish
+		StartRemaining = 0,
 		Deadline = math.huge,
 
 		Connections = {},
 		Folder = nil,
 	}, Voice)
-
-	for i, param in patch.Params do
-		local start = params and params[param.Name]
-		local value = if type(start) == 'number' then math.clamp(start, param.Min, param.Max) else param.Default
-
-		self.Values[i] = value
-		self.Targets[i] = value
-	end
 
 	local folder = Instance.new('Folder')
 	folder.Name = patch.Name
@@ -149,13 +265,48 @@ function Voice.new(patch, slots, params)
 	self:_Build(slots, folder)
 	self:_Wire(folder)
 
-	--// Every binding once, so the graph starts where its parameters are
-	for index in patch.Bindings do
-		self:_Apply(index, os.clock())
-	end
+	self.StartRemaining = self.Remaining
+	self:_Reset(params)
 
 	folder.Parent = Mixer.VoiceFolder()
 
+	self:_Begin()
+
+	return self
+end
+
+--[[
+	Puts every parameter at its starting value and writes every binding once, so the graph starts
+	where its parameters are
+
+	@param params {[string]: number}?
+	@return nil
+--]]
+function Voice._Reset(self, params)
+	local now = os.clock()
+
+	for i, param in self.Patch.Params do
+		local start = params and params[param.Name]
+		local value = if type(start) == 'number' then math.clamp(start, param.Min, param.Max) else param.Default
+
+		self.Values[i] = value
+		self.Targets[i] = value
+		self.Dirty[i] = false
+	end
+
+	self.AnyDirty = false
+
+	for index in self.Patch.Bindings do
+		self:_Apply(index, now)
+	end
+end
+
+--[[
+	Asks the mixer for a place and starts sounding if it gets one
+
+	@return nil
+--]]
+function Voice._Begin(self)
 	if Mixer.Add(self) then
 		self.Real = true
 		self.Envelope = 1
@@ -163,11 +314,70 @@ function Voice.new(patch, slots, params)
 		self:_Start(os.clock())
 
 		if self.Alive then self:_WriteGates() end
-	elseif patch.OneShot then
+	elseif self.Patch.OneShot then
 		self:_Teardown()
 	end
+end
 
-	return self
+--[[
+	Whether a spare voice sits on exactly these slots, so it can be revived without moving anything
+
+	@param slots {[string]: Instance | {Instance}}?
+	@return boolean
+--]]
+function Voice._SitsOn(self, slots): boolean
+	for index, list in self.Slots do
+		local slot = slots and slots[self.Patch.Plans[index].At]
+
+		if typeof(slot) == 'Instance' then
+			if #list ~= 1 or list[1] ~= slot then return false end
+		elseif type(slot) == 'table' then
+			if #slot ~= #list then return false end
+
+			for i, at in slot do
+				if list[i] ~= at then return false end
+			end
+		else
+			return false
+		end
+	end
+
+	return true
+end
+
+--[[
+	Brings a spare one-shot back as if it were new; its instances still hold what they were last
+	written, so only the properties that differ are written again
+
+	@param params {[string]: number}?
+	@return nil
+--]]
+function Voice._Revive(self, params)
+	self.Parked = false
+	self.Alive = true
+	self.Dying = false
+	self.Real = false
+	self.Sounding = false
+
+	for index, want in self.StartWants do
+		self.Players[index] = want
+
+		--// A player cut short, or run to its end, does not start from the top again on its own
+		self.Nodes[index].TimePosition = 0
+	end
+
+	self.Remaining = self.StartRemaining
+	self.Deadline = math.huge
+	self.Waiting = false
+
+	self.PatchVolume = self.Patch.Volume
+	self.Envelope = 0
+	self.EnvelopeTarget = 0
+	self.FadeRate = 0
+	self.GateDirty = true
+
+	self:_Reset(params)
+	self:_Begin()
 end
 
 --[[
@@ -183,8 +393,11 @@ function Voice._Build(self, slots, folder: Folder)
 	for index, plan in patch.Plans do
 		if plan.Kind == 'Emitter' then
 			local emitters = {}
+			local list = slotOf(slots, plan.At, patch.Name)
 
-			for _, at in slotOf(slots, plan.At, patch.Name) do
+			self.Slots[index] = list
+
+			for _, at in list do
 				local emitter = Instance.new('AudioEmitter')
 				emitter.Name = plan.Name or plan.At
 				emitter.AudioInteractionGroup = self.Bus.Group
@@ -202,7 +415,7 @@ function Voice._Build(self, slots, folder: Folder)
 				table.insert(
 					self.Connections,
 					at.Destroying:Connect(function()
-						self:Destroy(0)
+						self:_LoseSlot()
 					end)
 				)
 			end
@@ -263,6 +476,7 @@ function Voice._AdoptPlayer(self, index: number, plan, player: AudioPlayer)
 	local want = if plan.Play ~= nil then plan.Play else (player.Looping or oneShot)
 
 	self.Players[index] = want
+	self.StartWants[index] = want
 
 	if player.Looping then return end
 
@@ -276,6 +490,10 @@ function Voice._AdoptPlayer(self, index: number, plan, player: AudioPlayer)
 			if not self.Alive then return end
 
 			if oneShot then
+				--// Counted once per run: a revived voice must not be finished by a late end from its last one
+				if not self.Players[index] then return end
+				self.Players[index] = false
+
 				self.Remaining -= 1
 				if self.Remaining <= 0 then self:Destroy(0) end
 			else
@@ -677,7 +895,8 @@ function Voice._Step(self, deltaTime: number, now: number)
 end
 
 --[[
-	Destroys everything the voice made and drops it from the mix
+	Drops the voice from the mix. A one-shot is kept built as a spare for its patch's next Play;
+	anything else has everything it made destroyed.
 
 	@return nil
 --]]
@@ -686,7 +905,45 @@ function Voice._Teardown(self)
 
 	self.Alive = false
 	self.Sounding = false
+	Mixer.Remove(self)
 
+	if self.Patch.OneShot and not self.SlotGone then
+		self:_Park()
+	else
+		self:_Free()
+	end
+end
+
+--[[
+	Stops a finished one-shot and puts it in its patch's Spare, destroying the oldest spare if that is full
+
+	@return nil
+--]]
+function Voice._Park(self)
+	for index, want in self.Players do
+		if want then self.Nodes[index]:Stop() end
+		self.Players[index] = false
+	end
+
+	self.Parked = true
+
+	local spare = self.Patch.Spare
+
+	if #spare >= Config.SpareVoices then
+		local oldest = table.remove(spare, 1)
+		oldest.Parked = false
+		oldest:_Free()
+	end
+
+	table.insert(spare, self)
+end
+
+--[[
+	Destroys everything the voice made
+
+	@return nil
+--]]
+function Voice._Free(self)
 	for _, connection in self.Connections do
 		connection:Disconnect()
 	end
@@ -698,7 +955,27 @@ function Voice._Teardown(self)
 	end
 
 	self.Folder:Destroy()
-	Mixer.Remove(self)
+end
+
+--[[
+	Something an emitter sits on is being destroyed: the voice ends for good, spare or not
+
+	@return nil
+--]]
+function Voice._LoseSlot(self)
+	self.SlotGone = true
+
+	if not self.Parked then
+		self:Destroy(0)
+		return
+	end
+
+	local spare = self.Patch.Spare
+	local index = table.find(spare, self)
+	if index then table.remove(spare, index) end
+
+	self.Parked = false
+	self:_Free()
 end
 
 --// ---------------------------------------------------------------- Public
@@ -756,7 +1033,7 @@ function Voice.Play(self, name: string)
 	assert(index and self.Players[index] ~= nil, `Audio.Patch '{self.Patch.Name}' - has no player named '{name}'`)
 
 	local looping = self.Nodes[index].Looping
-	
+
 	if not looping and not self.Sounding then return end
 
 	--// Re-asking for a finished one-off has to start it again

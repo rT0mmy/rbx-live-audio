@@ -78,7 +78,9 @@ function PatchClass:Spawn(slots, params)
 end
 
 --[[
-	Fires a OneShot patch and forgets it; it cleans itself up when it ends
+	Fires a OneShot patch and forgets it. When it ends it is kept built and reused by a later Play on
+	the same slots, so a returned voice is only good for cutting short until it ends. Nothing is built
+	when its bus is full or the listener is past its distance curve's reach.
 
 	@param slots {[string]: Instance | {Instance}}?
 	@param params {[string]: number}?
@@ -87,7 +89,7 @@ end
 function PatchClass:Play(slots, params)
 	assert(self.OneShot, `Audio.Patch '{self.Name}' - Play is for OneShot patches; use Spawn and keep the voice`)
 
-	return Voice.new(self, slots, params)
+	return Voice.Fire(self, slots, params)
 end
 
 --[[
