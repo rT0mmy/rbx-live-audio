@@ -131,6 +131,7 @@ Audio.Node = Node.Of
 
 --// ---------------------------------------------------------------- Mix
 
+Audio.Configure = Mixer.Configure
 Audio.Mount = Mixer.Mount
 Audio.SetBusVolume = Mixer.SetVolume
 Audio.GetBusVolume = Mixer.GetVolume

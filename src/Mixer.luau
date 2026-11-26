@@ -15,7 +15,6 @@ local RunService = game:GetService('RunService')
 local SoundService = game:GetService('SoundService')
 
 local Config = require(`./Config`)
-local Profiler = require(`@game/ReplicatedStorage/Modules/Shared/Profiler`)
 
 local Mixer = {}
 
@@ -112,7 +111,7 @@ end
 	@return nil
 --]]
 local function step(deltaTime: number)
-	Profiler.Begin('Audio')
+	Config.Profiler.Begin('Audio')
 
 	local now = os.clock()
 
@@ -127,7 +126,7 @@ local function step(deltaTime: number)
 		voice:_Step(deltaTime, now)
 	end
 
-	Profiler.End()
+	Config.Profiler.End()
 end
 
 --[[
@@ -141,6 +140,22 @@ local function followCamera()
 
 	for _, bus in buses do
 		if bus.Listener then bus.Listener.Parent = camera end
+	end
+end
+
+--[[
+	Replaces settings in Config, such as the game's own Buses or Profiler. The mix is built from
+	Config once, so this has to come before Mount and before anything plays.
+
+	@param options {[string]: any} -- keys of Config
+	@return nil
+--]]
+function Mixer.Configure(options: { [string]: any })
+	assert(not mounted, 'Audio.Configure - call it before Audio.Mount and before anything plays')
+
+	for key, value in options do
+		assert(Config[key] ~= nil, `Audio.Configure - unknown setting '{key}'`)
+		Config[key] = value
 	end
 end
 

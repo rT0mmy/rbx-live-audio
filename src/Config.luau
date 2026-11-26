@@ -2,53 +2,14 @@
 
 local Config = {}
 
---// The mix
+--// The mix, parents before children. A game swaps in its own with Audio.Configure({ Buses = ... })
+--// before anything plays.
 Config.Buses = {
 	{ Name = 'Master' },
-
-	{ Name = 'World', Parent = 'Master', Spatial = true, Voices = 24 },
-	{ Name = 'Ambient', Parent = 'World', Spatial = true, Voices = 16, Duck = 'Hero' },
-
-	{ Name = 'Vehicles', Parent = 'World' },
-
-	{ Name = 'Engine', Parent = 'Vehicles' },
-	{ Name = 'EngineLoop', Parent = 'Engine', Spatial = true, Voices = 8, Duck = 'Hero' },
-	{ Name = 'EngineTransient', Parent = 'Engine', Spatial = true, Voices = 16, Duck = 'Hero' },
-
-	--// Pops and anti-lag bangs. Uncapped: each car holds an idle voice per exhaust, ready to fire
-	{ Name = 'Afterfire', Parent = 'Engine', Spatial = true, Duck = 'Hero' },
-
-	--// The clients car (Hero)
-	{
-		Name = 'Hero',
-		Parent = 'Engine',
-		Spatial = true,
-		Chain = {
-			{
-				Class = 'AudioEqualizer',
-				LowGain = 2.5,
-				MidGain = 0,
-				HighGain = 1,
-				MidRange = NumberRange.new(220, 4500),
-			},
-			{ Class = 'AudioCompressor', Threshold = -20, Ratio = 3, Attack = 0.008, Release = 0.12, MakeupGain = 1 },
-		} :: { any },
-	},
-
-	{ Name = 'Tyres', Parent = 'Vehicles', Spatial = true, Voices = 8 },
-	{ Name = 'Brakes', Parent = 'Vehicles', Spatial = true, Voices = 6 },
-
-	{ Name = 'Impacts', Parent = 'Vehicles', Spatial = true },
-	{ Name = 'Road', Parent = 'Vehicles', Spatial = true, Voices = 4 },
-	{ Name = 'Wind', Parent = 'Vehicles', Spatial = true, Voices = 2 },
-	{ Name = 'Horn', Parent = 'Vehicles', Spatial = true, Voices = 6 },
-	{ Name = 'Siren', Parent = 'Vehicles', Spatial = true, Voices = 4 },
-
+	{ Name = 'World', Parent = 'Master', Spatial = true, Voices = 32 },
 	{ Name = 'Music', Parent = 'Master' },
 	{ Name = 'UI', Parent = 'Master' },
-
-	{ Name = 'Debug', Parent = 'Master' },
-}
+} :: { { [string]: any } }
 
 Config.Master = {
 	Threshold = -6, -- dB
@@ -103,5 +64,11 @@ Config.SpareVoices = 4
 
 Config.FolderName = '_Audio'
 Config.GroupPrefix = 'Audio/'
+
+--// Brackets the mixer's work each frame; a game can hand in its own pair through Audio.Configure
+Config.Profiler = {
+	Begin = debug.profilebegin :: (label: string) -> (),
+	End = debug.profileend :: () -> (),
+}
 
 return Config
