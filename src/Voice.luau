@@ -58,38 +58,84 @@ local function applyStatic(instance: Instance, plan, patchName: string)
 end
 
 --[[
-	The slot instances an emitter sits on
+	Whether a slot entry is a point in the world rather than an instance
 
-	@param slots {[string]: Instance | {Instance}}?
+	@param at any
+	@return boolean
+--]]
+local function isPoint(at: any): boolean
+	local kind = typeof(at)
+
+	return kind == 'Vector3' or kind == 'CFrame'
+end
+
+--[[
+	A slot as a list of entries, whether it was given as one or many
+
+	@param slot any
+	@return any
+--]]
+local function listOf(slot: any): any
+	if typeof(slot) == 'Instance' or isPoint(slot) then return { slot } end
+
+	return slot
+end
+
+--[[
+	The entries an emitter sits on: instances, and points it will be given attachments for
+
+	@param slots {[string]: Slot | {Slot}}?
 	@param name string
 	@param patchName string
-	@return {Instance}
+	@return {Instance | Vector3 | CFrame}
 --]]
-local function slotOf(slots, name: string, patchName: string): { Instance }
+local function slotOf(slots, name: string, patchName: string): { any }
 	local slot = slots and slots[name]
 	assert(slot, `Audio.Patch '{patchName}' - spawned without slot '{name}'`)
 
-	local list = if typeof(slot) == 'Instance' then { slot } else slot
+	local list = listOf(slot)
 	assert(type(list) == 'table' and #list > 0, `Audio.Patch '{patchName}' - slot '{name}' is empty`)
 
 	--// An emitter under anything else has no position and is silently never heard
 	for _, at in list do
 		assert(
-			typeof(at) == 'Instance' and (at:IsA('Attachment') or at:IsA('PVInstance') or at:IsA('Camera')),
-			`Audio.Patch '{patchName}' - slot '{name}' must be an Attachment, part, model or camera`
+			isPoint(at)
+				or (typeof(at) == 'Instance' and (at:IsA('Attachment') or at:IsA('PVInstance') or at:IsA('Camera'))),
+			`Audio.Patch '{patchName}' - slot '{name}' must be an Attachment, part, model, camera, Vector3 or CFrame`
 		)
 	end
 
-	return list
+	--// A copy, as points in it are swapped for the attachments made for them
+	return table.clone(list)
 end
 
 --[[
-	Where a slot instance is, for judging whether a one-shot on it could be heard
+	Puts an attachment the voice owns at a point. It lives on Terrain, which sits at the origin, so
+	its local placement is its world one.
 
-	@param at Instance
+	@param attachment Attachment
+	@param at Vector3 | CFrame
+	@return nil
+--]]
+local function place(attachment: Attachment, at: any)
+	if typeof(at) == 'CFrame' then
+		attachment.CFrame = at
+	else
+		attachment.Position = at
+	end
+end
+
+--[[
+	Where a slot entry is, for judging whether a one-shot on it could be heard
+
+	@param at Instance | Vector3 | CFrame
 	@return Vector3? -- nil for a camera, which is always in earshot
 --]]
-local function positionOf(at: Instance): Vector3?
+local function positionOf(at: any): Vector3?
+	local kind = typeof(at)
+
+	if kind == 'Vector3' then return at end
+	if kind == 'CFrame' then return at.Position end
 	if at:IsA('Attachment') then return at.WorldPosition end
 	if at:IsA('BasePart') then return at.Position end
 	if at:IsA('Model') then return at:GetPivot().Position end
@@ -114,26 +160,19 @@ local function outOfReach(patch, slots): boolean
 	local reach = patch.Reach
 
 	local function far(at: any): boolean
-		if typeof(at) ~= 'Instance' then return false end
+		if typeof(at) ~= 'Instance' and not isPoint(at) then return false end
 
 		local position = positionOf(at)
 
 		return position ~= nil and (position - listener).Magnitude > reach
 	end
 
-	for _, plan in patch.Plans do
-		if plan.Kind ~= 'Emitter' then continue end
+	for _, index in patch.Emitters do
+		local list = listOf(slots[patch.Plans[index].At])
+		if type(list) ~= 'table' or #list == 0 then return false end
 
-		local slot = slots[plan.At]
-
-		if typeof(slot) == 'Instance' then
-			if not far(slot) then return false end
-		elseif type(slot) == 'table' and #slot > 0 then
-			for _, at in slot do
-				if not far(at) then return false end
-			end
-		else
-			return false
+		for _, at in list do
+			if not far(at) then return false end
 		end
 	end
 
@@ -193,6 +232,7 @@ function Voice.Fire(patch, slots, params)
 
 		if voice:_SitsOn(slots) then
 			table.remove(spare, i)
+			voice:_Place(slots)
 			voice:_Revive(params)
 
 			return voice
@@ -224,6 +264,7 @@ function Voice.new(patch, slots, params)
 		Parked = false, -- a finished one-shot kept in its patch's Spare
 		SlotGone = false, -- something it sits on was destroyed, so it can never be reused
 		Real = false, -- the mixer has given it a place
+		Counted = false, -- counted in its bus's Sounding; kept by Mixer.Recount
 		Sounding = false, -- its players are running; stays true through a fade-out
 
 		Values = table.create(paramCount, 0),
@@ -242,6 +283,7 @@ function Voice.new(patch, slots, params)
 		Crossfades = {}, -- plans
 		Emitters = {},
 		Slots = {}, -- [emitter plan] = the instances its emitters sit on
+		Owned = {}, -- [Attachment] = true for each it made to stand at a point
 		Waiting = false, -- a crossfade layer has gone quiet and is due to stop
 
 		PatchVolume = patch.Volume,
@@ -309,6 +351,7 @@ end
 function Voice._Begin(self)
 	if Mixer.Add(self) then
 		self.Real = true
+		Mixer.Recount(self)
 		self.Envelope = 1
 		self.EnvelopeTarget = 1
 		self:_Start(os.clock())
@@ -320,29 +363,43 @@ function Voice._Begin(self)
 end
 
 --[[
-	Whether a spare voice sits on exactly these slots, so it can be revived without moving anything
+	Whether a spare voice can be revived on these slots without reparenting anything: the same
+	instances, or points where it has attachments of its own, which only have to move
 
-	@param slots {[string]: Instance | {Instance}}?
+	@param slots {[string]: Slot | {Slot}}?
 	@return boolean
 --]]
 function Voice._SitsOn(self, slots): boolean
 	for index, list in self.Slots do
-		local slot = slots and slots[self.Patch.Plans[index].At]
+		local given = listOf(slots and slots[self.Patch.Plans[index].At])
+		if type(given) ~= 'table' or #given ~= #list then return false end
 
-		if typeof(slot) == 'Instance' then
-			if #list ~= 1 or list[1] ~= slot then return false end
-		elseif type(slot) == 'table' then
-			if #slot ~= #list then return false end
-
-			for i, at in slot do
-				if list[i] ~= at then return false end
+		for i, at in given do
+			if self.Owned[list[i]] then
+				if not isPoint(at) then return false end
+			elseif list[i] ~= at then
+				return false
 			end
-		else
-			return false
 		end
 	end
 
 	return true
+end
+
+--[[
+	Moves the attachments the voice made for points to where these slots put them
+
+	@param slots {[string]: Slot | {Slot}}?
+	@return nil
+--]]
+function Voice._Place(self, slots)
+	for index, list in self.Slots do
+		local given = listOf(slots[self.Patch.Plans[index].At])
+
+		for i, attachment in list do
+			if self.Owned[attachment] then place(attachment, given[i]) end
+		end
+	end
 end
 
 --[[
@@ -395,6 +452,19 @@ function Voice._Build(self, slots, folder: Folder)
 			local emitters = {}
 			local list = slotOf(slots, plan.At, patch.Name)
 
+			--// A point gets an attachment of the voice's own, so its emitter has something to sit on
+			for i, at in list do
+				if not isPoint(at) then continue end
+
+				local attachment = Instance.new('Attachment')
+				attachment.Name = `{patch.Name}_{plan.At}`
+				place(attachment, at)
+				attachment.Parent = workspace.Terrain
+
+				self.Owned[attachment] = true
+				list[i] = attachment
+			end
+
 			self.Slots[index] = list
 
 			for _, at in list do
@@ -412,12 +482,14 @@ function Voice._Build(self, slots, folder: Folder)
 				table.insert(emitters, emitter)
 				table.insert(self.Emitters, emitter)
 
-				table.insert(
-					self.Connections,
-					at.Destroying:Connect(function()
-						self:_LoseSlot()
-					end)
-				)
+				if not self.Owned[at] then
+					table.insert(
+						self.Connections,
+						at.Destroying:Connect(function()
+							self:_LoseSlot()
+						end)
+					)
+				end
 			end
 
 			self.Nodes[index] = emitters
@@ -793,6 +865,9 @@ function Voice._SetReal(self, real: boolean)
 	if real == self.Real or self.Dying then return end
 	self.Real = real
 
+	Mixer.Recount(self)
+	Mixer.Wake(self)
+
 	if real then
 		self:_Start(os.clock())
 		self.EnvelopeTarget = 1
@@ -837,13 +912,19 @@ function Voice._Step(self, deltaTime: number, now: number)
 	local values, targets, dirty = self.Values, self.Targets, self.Dirty
 	local anyDirty = self.AnyDirty
 
+	local moving = false
+
 	for i, param in params do
 		local current, target = values[i], targets[i]
 
 		if current ~= target then
-			values[i] = Value.Approach(current, target, param.Smooth, deltaTime)
+			local next = Value.Approach(current, target, param.Smooth, deltaTime)
+
+			values[i] = next
 			dirty[i] = true
 			anyDirty = true
+
+			if next ~= target then moving = true end
 		end
 	end
 
@@ -891,7 +972,15 @@ function Voice._Step(self, deltaTime: number, now: number)
 	if self.GateDirty then self:_WriteGates() end
 	if self.Waiting then self:_StopQuietLayers(now) end
 
-	if now >= self.Deadline then self:Destroy(0) end
+	if now >= self.Deadline then
+		self:Destroy(0)
+		return
+	end
+
+	--// Settled: nothing changes until a Set, a fade or the mixer wakes it
+	if not moving and not self.Waiting and self.Envelope == self.EnvelopeTarget and self.Deadline == math.huge then
+		Mixer.Sleep(self)
+	end
 end
 
 --[[
@@ -954,6 +1043,10 @@ function Voice._Free(self)
 		emitter:Destroy()
 	end
 
+	for attachment in self.Owned do
+		attachment:Destroy()
+	end
+
 	self.Folder:Destroy()
 end
 
@@ -997,6 +1090,7 @@ function Voice.Set(self, name: string, value: number, snap: boolean?)
 	local param = self.Patch.Params[index]
 	value = math.clamp(value, param.Min, param.Max)
 
+	if self.Targets[index] == value and not snap then return end
 	self.Targets[index] = value
 
 	if (snap or param.Smooth <= 0) and self.Values[index] ~= value then
@@ -1004,6 +1098,57 @@ function Voice.Set(self, name: string, value: number, snap: boolean?)
 		self.Dirty[index] = true
 		self.AnyDirty = true
 	end
+
+	Mixer.Wake(self)
+end
+
+--[[
+	Moves several parameters at once, as Set does each
+
+	@param values {[string]: number}
+	@param snap boolean?
+	@return nil
+--]]
+function Voice.SetMany(self, values: { [string]: number }, snap: boolean?)
+	for name, value in values do
+		self:Set(name, value, snap)
+	end
+end
+
+--[[
+	Moves a slot that was given as a point - a sound that follows a projectile, say - without a
+	restart. Only points move this way; a slot on an instance follows that instance already.
+
+	@param slot string -- the emitter's At name
+	@param at Vector3 | CFrame | {Vector3 | CFrame} -- one per point it was spawned with
+	@return nil
+--]]
+function Voice.Move(self, slot: string, at: any)
+	if not self.Alive then return end
+
+	local given = listOf(at)
+	local found = false
+
+	for index, list in self.Slots do
+		if self.Patch.Plans[index].At ~= slot then continue end
+		found = true
+
+		assert(
+			type(given) == 'table' and #given == #list,
+			`Audio.Patch '{self.Patch.Name}' - slot '{slot}' needs {#list} point(s)`
+		)
+
+		for i, attachment in list do
+			assert(
+				self.Owned[attachment] and isPoint(given[i]),
+				`Audio.Patch '{self.Patch.Name}' - slot '{slot}' was not spawned on points`
+			)
+
+			place(attachment, given[i])
+		end
+	end
+
+	assert(found, `Audio.Patch '{self.Patch.Name}' - has no slot '{slot}'`)
 end
 
 --[[
@@ -1086,6 +1231,8 @@ function Voice.Retune(self, name: string, ats: { number }, trims: { number }?)
 	for bindingIndex, binding in self.Patch.Bindings do
 		if binding.Plan == index then self:_Apply(bindingIndex, os.clock()) end
 	end
+
+	Mixer.Wake(self)
 end
 
 --[[
@@ -1102,6 +1249,8 @@ function Voice.Refresh(self)
 	for index in self.Patch.Bindings do
 		self:_Apply(index, now)
 	end
+
+	Mixer.Wake(self)
 end
 
 --[[
@@ -1127,6 +1276,8 @@ function Voice.Destroy(self, fade: number?)
 	if not self.Alive or self.Dying then return end
 	self.Dying = true
 
+	Mixer.Recount(self)
+
 	local seconds = fade or Config.Release
 
 	if seconds <= 0 or not self.Sounding or self.Envelope <= 0 then
@@ -1136,6 +1287,8 @@ function Voice.Destroy(self, fade: number?)
 
 	self.EnvelopeTarget = 0
 	self.FadeRate = 1 / seconds
+
+	Mixer.Wake(self)
 end
 
 --[[

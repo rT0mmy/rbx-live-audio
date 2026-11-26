@@ -46,8 +46,25 @@ local Mixer = require(`@self/Mixer`)
 local Node = require(`@self/Node`)
 local Patch = require(`@self/Patch`)
 local Pitch = require(`@self/Pitch`)
+local Types = require(`@self/Types`)
 local Value = require(`@self/Value`)
 local Voice = require(`@self/Voice`)
+
+export type Slot = Types.Slot
+export type Slots = Types.Slots
+export type Params = Types.Params
+export type ParamDef = Types.ParamDef
+export type Spec = Types.Spec
+export type Points = Types.Points
+export type Node = Types.Node
+export type PatchDef = Types.PatchDef
+export type BusDef = Types.BusDef
+export type Options = Types.Options
+export type Inspection = Types.Inspection
+export type VoiceInspection = Types.VoiceInspection
+export type BusInspection = Types.BusInspection
+export type Voice = Types.Voice
+export type Patch = Types.Patch
 
 local Audio = {}
 
@@ -59,21 +76,21 @@ PatchClass.__index = PatchClass
 --[[
 	Describes a sound. Errors here, at definition, for anything malformed.
 
-	@param def {[any]: any}
+	@param def PatchDef
 	@return Patch
 --]]
-function Audio.Patch(def)
-	return setmetatable(Patch.Compile(def), PatchClass)
+function Audio.Patch(def: PatchDef): Patch
+	return setmetatable(Patch.Compile(def), PatchClass) :: any
 end
 
 --[[
 	Makes a live voice from the patch
 
-	@param slots {[string]: Instance | {Instance}}? -- what each emitter sits on, by its At name
-	@param params {[string]: number}? -- starting values
+	@param slots Slots? -- what each emitter sits on, by its At name: instances, Vector3s or CFrames
+	@param params Params? -- starting values
 	@return Voice
 --]]
-function PatchClass:Spawn(slots, params)
+function PatchClass:Spawn(slots: Slots?, params: Params?): Voice
 	return Voice.new(self, slots, params)
 end
 
@@ -82,11 +99,11 @@ end
 	the same slots, so a returned voice is only good for cutting short until it ends. Nothing is built
 	when its bus is full or the listener is past its distance curve's reach.
 
-	@param slots {[string]: Instance | {Instance}}?
-	@param params {[string]: number}?
+	@param slots Slots?
+	@param params Params?
 	@return Voice
 --]]
-function PatchClass:Play(slots, params)
+function PatchClass:Play(slots: Slots?, params: Params?): Voice
 	assert(self.OneShot, `Audio.Patch '{self.Name}' - Play is for OneShot patches; use Spawn and keep the voice`)
 
 	return Voice.Fire(self, slots, params)
@@ -131,11 +148,11 @@ Audio.Node = Node.Of
 
 --// ---------------------------------------------------------------- Mix
 
-Audio.Configure = Mixer.Configure
-Audio.Mount = Mixer.Mount
-Audio.SetBusVolume = Mixer.SetVolume
-Audio.GetBusVolume = Mixer.GetVolume
-Audio.Inspect = Mixer.Inspect
+Audio.Configure = Mixer.Configure :: (options: Options) -> ()
+Audio.Mount = Mixer.Mount :: () -> ()
+Audio.SetBusVolume = Mixer.SetVolume :: (name: string, volume: number) -> ()
+Audio.GetBusVolume = Mixer.GetVolume :: (name: string) -> number
+Audio.Inspect = Mixer.Inspect :: () -> Inspection
 
 --// Tools: relative pitch between recordings, and the weighting a crossfade gives its layers
 Audio.Pitch = Pitch

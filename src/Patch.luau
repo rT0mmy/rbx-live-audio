@@ -63,6 +63,7 @@ export type Compiled = {
 	ParamIndex: { [string]: number },
 
 	Plans: { Plan },
+	Emitters: { number }, -- the emitter plans
 	Gates: { number }, -- one per top-level node; the voice's volume and fades live on these
 	BusGates: { number }, -- the gates that play straight into the bus rather than an emitter
 	Bindings: { Binding },
@@ -76,10 +77,27 @@ export type Compiled = {
 	Spare: { any }, -- OneShot: finished voices kept built for the next Play, oldest first
 }
 
+--// Config.Buses by name, rebuilt whenever Audio.Configure swaps in a new list
 local busByName: { [string]: any } = {}
+local indexedBuses: { { [string]: any } }? = nil
 
-for _, bus in Config.Buses do
-	busByName[bus.Name] = bus
+--[[
+	A bus definition from whatever Config.Buses holds now
+
+	@param name any
+	@return {[string]: any}?
+--]]
+local function busOf(name: any): { [string]: any }?
+	if indexedBuses ~= Config.Buses then
+		indexedBuses = Config.Buses
+		table.clear(busByName)
+
+		for _, bus in Config.Buses do
+			busByName[bus.Name] = bus
+		end
+	end
+
+	return busByName[name]
 end
 
 --[[
@@ -135,8 +153,11 @@ function Patch.Compile(def: { [any]: any }): Compiled
 	local name = if type(def.Name) == 'string' then def.Name else 'Patch'
 	local where = `Audio.Patch '{name}'`
 
-	local bus = busByName[def.Bus]
-	assert(bus, `{where} - Bus '{tostring(def.Bus)}' is not in Audio Config.Buses`)
+	local bus = busOf(def.Bus)
+	assert(
+		bus,
+		`{where} - Bus '{tostring(def.Bus)}' is not in Audio Config.Buses; call Audio.Configure before defining patches`
+	)
 
 	--// ---------------------------------------------------------------- Parameters
 
@@ -295,6 +316,7 @@ function Patch.Compile(def: { [any]: any }): Compiled
 	--// every fade. Under an emitter it sits just inside it; otherwise just before the bus.
 	local gates = {}
 	local busGates = {}
+	local emitters = {}
 	local spatial = false
 	local reach = 0
 
@@ -328,6 +350,7 @@ function Patch.Compile(def: { [any]: any }): Compiled
 				Angle = dictionary(desc.Angle),
 			}
 			plans[emitterIndex] = emitter
+			table.insert(emitters, emitterIndex)
 
 			for key, value in desc.Props do
 				if Value.Is(value) then
@@ -367,6 +390,41 @@ function Patch.Compile(def: { [any]: any }): Compiled
 
 		assert(source, `{where} - Send '{tostring(plan.Target)}' names no node in the patch`)
 		plan.Source = source
+	end
+
+	--// A send to a node its own output already flows into would wire a feedback loop
+	if #sends > 0 then
+		local feeds: { { number } } = table.create(#plans)
+		for i = 1, #plans do
+			feeds[i] = {}
+		end
+
+		for index, plan in plans do
+			for _, input in plan.Inputs do
+				local from = if plans[input].Kind == 'Send' then plans[input].Source :: number else input
+				table.insert(feeds[from], index)
+			end
+		end
+
+		--// 1 while on the path being walked, 2 once everything past it is known to be clear
+		local state: { [number]: number } = {}
+
+		local function walk(index: number)
+			state[index] = 1
+
+			for _, next in feeds[index] do
+				local seen = state[next]
+				assert(seen ~= 1, `{where} - a Send feeds '{plans[next].Name or plans[next].Class}' its own output`)
+
+				if seen == nil then walk(next) end
+			end
+
+			state[index] = 2
+		end
+
+		for index in plans do
+			if state[index] == nil then walk(index) end
+		end
 	end
 
 	local oneShot = def.OneShot == true
@@ -409,6 +467,7 @@ function Patch.Compile(def: { [any]: any }): Compiled
 		ParamIndex = paramIndex,
 
 		Plans = plans,
+		Emitters = emitters,
 		Gates = gates,
 		BusGates = busGates,
 		Bindings = bindings,

@@ -30,6 +30,7 @@ export type Bus = {
 	Cap: number?,
 	Volume: number,
 	Voices: { [any]: boolean },
+	Sounding: number, -- voices holding a place: Real and not Dying
 }
 
 local mounted = false
@@ -38,12 +39,21 @@ local voiceFolder: Folder
 local buses: { [string]: Bus } = {}
 local voices: { [any]: boolean } = {}
 
+--// Voices with something to do next frame; a voice that has settled leaves until it is woken
+local active: { [any]: boolean } = {}
+local stepping = false
+local woken: { [any]: boolean } = {} -- woken mid-step, joined once the step is done
+
 --// Volumes asked for before the mixer was mounted
 local pendingVolumes: { [string]: number } = {}
 
 local budgetClock = 0
 local ranked = {}
 local scores = {}
+
+local function byScore(a, b): boolean
+	return scores[a] > scores[b]
+end
 
 --[[
 	Connects one node's output to another's input
@@ -90,11 +100,10 @@ local function budget()
 
 		if count == 0 then continue end
 
-		table.sort(ranked, function(a, b)
-			return scores[a] > scores[b]
-		end)
-
 		local cap = bus.Cap or math.huge
+
+		--// Order only matters when some must lose out
+		if count > cap then table.sort(ranked, byScore) end
 
 		for i = 1, count do
 			local voice = ranked[i]
@@ -121,10 +130,21 @@ local function step(deltaTime: number)
 		budget()
 	end
 
-	--// A voice that tears itself down removes its own key, which is safe mid-traversal
-	for voice in voices do
+	--// A voice that settles or tears itself down removes its own key, which is safe mid-traversal;
+	--// one woken meanwhile is held back, as adding a key mid-traversal is not
+	stepping = true
+
+	for voice in active do
 		voice:_Step(deltaTime, now)
 	end
+
+	stepping = false
+
+	for voice in woken do
+		if voices[voice] then active[voice] = true end
+	end
+
+	table.clear(woken)
 
 	Config.Profiler.End()
 end
@@ -255,6 +275,7 @@ function Mixer.Mount()
 			Cap = def.Voices,
 			Volume = volume,
 			Voices = {},
+			Sounding = 0,
 		}
 
 		if bus.Spatial then
@@ -324,6 +345,7 @@ function Mixer.Add(voice): boolean
 
 	voices[voice] = true
 	bus.Voices[voice] = true
+	Mixer.Wake(voice)
 
 	return Mixer.HasRoom(bus)
 end
@@ -335,16 +357,21 @@ end
 	@return boolean
 --]]
 function Mixer.HasRoom(bus: Bus): boolean
-	if not bus.Cap then return true end
+	return bus.Cap == nil or bus.Sounding < bus.Cap
+end
 
-	local sounding = 0
-	for other in bus.Voices do
-		if other.Real and not other.Dying then
-			sounding += 1
-		end
-	end
+--[[
+	Keeps its bus's count of sounding voices right; call it whenever the voice's Real or Dying changes
 
-	return sounding < bus.Cap
+	@param voice Voice
+	@return nil
+--]]
+function Mixer.Recount(voice)
+	local counted = voice.Real and not voice.Dying and voices[voice] == true
+	if counted == voice.Counted then return end
+
+	voice.Counted = counted
+	voice.Bus.Sounding += if counted then 1 else -1
 end
 
 --[[
@@ -353,7 +380,38 @@ end
 --]]
 function Mixer.Remove(voice)
 	voices[voice] = nil
+	active[voice] = nil
+	woken[voice] = nil
 	voice.Bus.Voices[voice] = nil
+
+	Mixer.Recount(voice)
+end
+
+--[[
+	Steps a voice from the next frame on, until it settles again
+
+	@param voice Voice
+	@return nil
+--]]
+function Mixer.Wake(voice)
+	if not voices[voice] then return end
+
+	--// Even one already stepping, in case it settles later in the same pass
+	if stepping then
+		woken[voice] = true
+	else
+		active[voice] = true
+	end
+end
+
+--[[
+	A voice that has nothing left to do stops being stepped
+
+	@param voice Voice
+	@return nil
+--]]
+function Mixer.Sleep(voice)
+	active[voice] = nil
 end
 
 --[[

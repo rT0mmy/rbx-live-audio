@@ -43,12 +43,18 @@ voice:Destroy()
 ```
 
 Each node's inputs are listed inside it, so a patch reads from the speakers inwards. An emitter's
-slot (`At`) can be one instance or a list of them, which gives one emitter per instance.
+slot (`At`) can be one instance or a list of them, which gives one emitter per instance. A slot can
+also be a `Vector3` or `CFrame`: the voice makes its own attachment on Terrain there, which
+`voice:Move` can move later.
+
+```lua
+Explosion:Play({ Origin = hit.Position })
+```
 
 ## Setup
 
-Voices only play on the client. Configure the mix once at startup, before anything plays, then
-mount it:
+Voices only play on the client. Configure the mix once at startup, before any patch is defined
+(a patch checks its `Bus` against the configured mix), then mount it:
 
 ```lua
 Audio.Configure({
@@ -90,8 +96,9 @@ Every other setting in `src/Config.luau` can be changed through `Configure` as w
 `def` takes `Name`, `Bus`, `Priority`, `Params`, `Volume` and `OneShot`.
 - `patch:Spawn(slots, params)` returns a voice you keep.
 - `patch:Play(slots, params)` fires a `OneShot` patch. When it finishes it is kept built and reused
-  by the next `Play` on the same slots. Nothing is built if its bus is full or the listener is
-  outside the patch's distance curve.
+  by the next `Play` on the same slots, or on any points if it was played on points; its
+  attachments just move. Nothing is built if its bus is full or the listener is outside the
+  patch's distance curve.
 - `patch:Preload()` loads every asset the patch uses (yields).
 
 **Values:** `Audio.Bind(param, scale?)`, `Audio.Curve(param, points)` and
@@ -105,7 +112,9 @@ Every other setting in `src/Config.luau` can be changed through `Configure` as w
 - `Audio.Node(className)` wraps any other `Audio*` class that has Input and Output pins.
 
 **Voices:**
-- `voice:Set(name, value, snap?)` and `voice:Get(name)` read and write parameters.
+- `voice:Set(name, value, snap?)`, `voice:SetMany({ [name]: value }, snap?)` and `voice:Get(name)`
+  read and write parameters.
+- `voice:Move(slot, at)` moves a slot that was given as a point (or a list of them).
 - `voice:Play(name)` and `voice:Stop(name)` control named players.
 - `voice:Retune(name, ats, trims?)` changes a crossfade's layer points without a restart, and
   `voice:Refresh()` re-applies the voice's current values.
@@ -113,6 +122,10 @@ Every other setting in `src/Config.luau` can be changed through `Configure` as w
 
 **Mix:** `Audio.Configure`, `Audio.Mount`, `Audio.SetBusVolume`, `Audio.GetBusVolume`, and
 `Audio.Inspect()`, which returns a snapshot of buses and voices for debugging.
+
+**Types:** `Audio.Voice`, `Audio.Patch`, `Audio.Slots`, `Audio.Params`, `Audio.ParamDef`,
+`Audio.BusDef`, `Audio.Options` and `Audio.Inspection`, for annotating your own code:
+`local engine: Audio.Voice = Engine:Spawn(...)`.
 
 **Tools:** `Audio.Pitch` measures relative pitch between recordings (AudioAnalyzer spectra), and
 `Audio.CrossfadeWeights` returns the weighting a crossfade gives its layers.
@@ -130,4 +143,9 @@ Every other setting in `src/Config.luau` can be changed through `Configure` as w
 ## Development
 
 Tools are pinned in `aftman.toml`. `rojo build -o Audio.rbxm` builds the model;
-`stylua src` and `selene src` format and lint it.
+`stylua src tests` and `selene src` format and lint it.
+
+`lune run tests/run` runs the tests. They run the library outside Roblox against a small mock of
+the engine (`tests/Mock.luau`), so they cover the library's own logic: patch compiling, the voice
+lifecycle, the budget, and spare reuse. CI runs the format check, lint, a `luau-lsp` type check and
+the tests on every push and pull request.
