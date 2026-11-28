@@ -1,9 +1,10 @@
 --!strict
 --!native
+local Mock = require('./Mock'); local game, workspace, Instance, Enum, typeof, Vector3, CFrame = Mock.game, Mock.workspace, Mock.Instance, Mock.Enum, Mock.typeof, Mock.Vector3, Mock.CFrame
 
 local Crossfade = {}
 
-const HALF_PI = math.pi / 2
+local HALF_PI = math.pi / 2
 
 --[[
 	Which two layers sound at `x`, and how loud each is

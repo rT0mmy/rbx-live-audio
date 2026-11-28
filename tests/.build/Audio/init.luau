@@ -1,5 +1,6 @@
 --!nonstrict
 --!native
+local Mock = require('@self/Mock'); local game, workspace, Instance, Enum, typeof, Vector3, CFrame = Mock.game, Mock.workspace, Mock.Instance, Mock.Enum, Mock.typeof, Mock.Vector3, Mock.CFrame
 
 --// Declarative audio on the Audio API
 --//

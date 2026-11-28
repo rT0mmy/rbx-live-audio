@@ -1,5 +1,6 @@
 --!strict
 --!native
+local Mock = require('./Mock'); local game, workspace, Instance, Enum, typeof, Vector3, CFrame = Mock.game, Mock.workspace, Mock.Instance, Mock.Enum, Mock.typeof, Mock.Vector3, Mock.CFrame
 
 local Value = {}
 
@@ -13,7 +14,7 @@ export type Spec = {
 	Fn: ((...number) -> any)?, -- Compute
 }
 
-const KINDS = { Bind = true, Curve = true, Compute = true }
+local KINDS = { Bind = true, Curve = true, Compute = true }
 
 --[[
 	Whether something is a spec rather than a constant
