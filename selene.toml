@@ -1,4 +1,0 @@
-std = "roblox"
-
-[config]
-empty_if = { level = "warning" }
