@@ -1,6 +1,5 @@
 --!strict
 --!native
-local Mock = require('./Mock'); local game, workspace, Instance, Enum, typeof, Vector3, CFrame = Mock.game, Mock.workspace, Mock.Instance, Mock.Enum, Mock.typeof, Mock.Vector3, Mock.CFrame
 
 local Value = require(`./Value`)
 
@@ -36,8 +35,8 @@ export type Layer = {
 }
 
 --// Keys a node reads itself rather than passing to its instance
-local RESERVED = { Name = true, Play = true }
-local EMITTER_RESERVED = { Name = true, At = true, Distance = true, Angle = true }
+const RESERVED = { Name = true, Play = true }
+const EMITTER_RESERVED = { Name = true, At = true, Distance = true, Angle = true }
 
 --[[
 	Whether something is a node description

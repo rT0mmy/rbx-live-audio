@@ -1,6 +1,5 @@
 --!strict
 --!native
-local Mock = require('./Mock'); local game, workspace, Instance, Enum, typeof, Vector3, CFrame = Mock.game, Mock.workspace, Mock.Instance, Mock.Enum, Mock.typeof, Mock.Vector3, Mock.CFrame
 
 --// Helper utility for analyzing spectral pitch of sounds
 
